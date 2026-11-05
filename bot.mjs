@@ -50,6 +50,7 @@ db.orders ??= {};
 db.buyers ??= {};
 db.users ??= {};
 db.supportMap ??= {};
+db.pendingDelivery ??= []; // оплатили, когда установщик ещё не был загружен
 // настройки, которые админ меняет прямо в боте; значения из окружения — только стартовые
 db.settings = {
   priceRub: Number(env.PRICE_RUB) || 1990,
@@ -225,9 +226,18 @@ async function sendProduct(chatId) {
   } else if (DOWNLOAD_URL) {
     await send(chatId, `Скачать: ${esc(DOWNLOAD_URL)}`);
   } else {
+    // файла нет — запоминаем покупателя, продавец отправит ему файл одной кнопкой
+    if (!db.pendingDelivery.includes(chatId)) db.pendingDelivery.push(chatId);
+    save();
     await send(chatId, 'Файл пришлём в ближайшее время — продавец уже получил уведомление.');
-    if (db.adminId) await send(db.adminId, `⚠ Покупатель (id ${chatId}) оплатил, но установщик не загружен. /admin → «Загрузить установщик», потом /resend ${chatId}`).catch(() => {});
+    if (db.adminId) {
+      await send(db.adminId, `⚠ Покупатель (id ${chatId}) оплатил, но установщик ещё не загружен.\n\n1) «📦 Загрузить установщик» — пришлите файл\n2) «📤 Отправить покупателю»`,
+        [[btn('📦 Загрузить установщик', 'adm:file')], [btn('📤 Отправить покупателю', `resend:${chatId}`)]]).catch(() => {});
+    }
+    return;
   }
+  db.pendingDelivery = db.pendingDelivery.filter((id) => id !== chatId);
+  save();
 }
 
 // ---------------------------------------------------------------- экраны покупателя
@@ -557,6 +567,9 @@ async function onMessage(msg) {
       db.fileName = msg.document.file_name ?? null;
       save();
       await send(chatId, `✓ Установщик сохранён: ${esc(db.fileName ?? 'файл')}. Покупатели получат его сразу после оплаты.`);
+      if (db.pendingDelivery.length) {
+        return send(chatId, `Файла ждут покупатели: ${db.pendingDelivery.length}.`, [[btn(`📤 Отправить всем (${db.pendingDelivery.length})`, 'resend:all')]]);
+      }
       return adminPanel(chatId);
     }
     if (w.kind === 'set' && isAdmin(u.id) && text) {
@@ -675,6 +688,16 @@ async function onCallback(q) {
       }
   }
 
+  // отправить установщик покупателю (или всем ожидающим) одной кнопкой
+  if (action === 'resend' && isAdmin(u.id)) {
+    if (!db.fileId && !DOWNLOAD_URL) {
+      return send(chatId, 'Сначала загрузите установщик — потом нажмите «Отправить» ещё раз.', [[btn('📦 Загрузить установщик', 'adm:file')]]);
+    }
+    const list = arg === 'all' ? [...db.pendingDelivery] : [Number(arg)];
+    for (const id of list) await sendProduct(id);
+    return show(chatId, msgId, `✓ Установщик отправлен: ${list.length === 1 ? `покупатель id ${list[0]}` : `${list.length} покупателям`}.`, []);
+  }
+
   if (action === 'adm' && isAdmin(u.id)) {
     waiting.delete(chatId);
     if (arg === 'panel') return adminPanel(chatId, msgId);
@@ -705,7 +728,7 @@ async function onCallback(q) {
     if (order.status === 'paid') return send(chatId, `Заказ №${order.id} уже выдан.`);
     if (action === 'ok') {
       await deliver(order);
-      return show(chatId, msgId, `✅ Заказ №${order.id} подтверждён, установщик отправлен покупателю.`, []);
+      return show(chatId, msgId, `✅ Заказ №${order.id} подтверждён${db.fileId || DOWNLOAD_URL ? ', установщик отправлен покупателю' : ''}.`, []);
     }
     order.status = 'rejected';
     save();
