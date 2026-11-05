@@ -1,0 +1,10 @@
+{
+  "name": "goatparsbot",
+  "private": true,
+  "type": "module",
+  "main": "bot.mjs",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node bot.mjs"
+  }
+}
