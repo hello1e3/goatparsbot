@@ -6,6 +6,8 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from '
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { PLATFORMS, validPlatform, migrateFiles, availableFile } from './platforms.mjs';
+
 const dir = path.dirname(fileURLToPath(import.meta.url));
 
 // ---------------------------------------------------------------- настройки
@@ -51,6 +53,7 @@ db.buyers ??= {};
 db.users ??= {};
 db.supportMap ??= {};
 db.pendingDelivery ??= []; // оплатили, когда установщик ещё не был загружен
+db.pendingPlatforms ??= {};
 // настройки, которые админ меняет прямо в боте; значения из окружения — только стартовые
 db.settings = {
   priceRub: Number(env.PRICE_RUB) || 1990,
@@ -69,6 +72,7 @@ db.settings = {
 // на хостинге data/ может пропасть при переносе — администратор и файл могут приходить из настроек
 if (!db.adminId && env.ADMIN_ID) db.adminId = Number(env.ADMIN_ID);
 if (!db.fileId && env.FILE_ID) db.fileId = env.FILE_ID;
+migrateFiles(db, env);
 
 function save() {
   // запись через временный файл: при сбое база не повредится
@@ -181,6 +185,7 @@ function newOrder(u, method, q, amount, currency) {
   const id = String(db.nextId++);
   db.orders[id] = {
     id, userId: u.id, chatId: u.id, user: who(u), method, amount, currency,
+    platform: db.users[u.id]?.platform || 'windows',
     rub: q.toPay, bonus: q.bonus, status: 'pending', createdAt: new Date().toISOString(),
   };
   save();
@@ -209,7 +214,7 @@ async function deliver(order) {
   save();
   log('Оплачен заказ', order.id, order.method, order.amount, order.currency, order.user);
   await send(order.chatId, `✅ <b>Оплата получена, спасибо!</b>\n\nЗаказ №${order.id}. Ниже — установщик <b>${esc(PRODUCT)}</b>.\nСкачать снова можно в любой момент в /profile.`);
-  await sendProduct(order.chatId);
+  await sendProduct(order.chatId, order.platform || 'windows');
   if (ref && refBonus) {
     await send(ref.id, `🎉 Ваш друг купил ${esc(PRODUCT)} по вашей ссылке. На бонусный баланс начислено <b>${rub(refBonus)}</b>.\n/profile — баланс и ссылка`).catch(() => {});
   }
@@ -220,24 +225,35 @@ async function deliver(order) {
 
 const methodName = (m) => ({ stars: 'звёзды', card: 'карта', crypto: 'крипта', balance: 'бонусы' })[m] ?? m;
 
-async function sendProduct(chatId) {
-  if (db.fileId) {
-    await api('sendDocument', { chat_id: chatId, document: db.fileId, caption: `${PRODUCT} — запустите установщик и следуйте подсказкам.` });
-  } else if (DOWNLOAD_URL) {
-    await send(chatId, `Скачать: ${esc(DOWNLOAD_URL)}`);
+async function platformScreen(chatId, msgId, mode = 'select') {
+  const admin = mode === 'upload';
+  return show(chatId, msgId, admin
+    ? 'Для какой платформы загрузить установщик?'
+    : 'Выберите платформу для GOAT Parser.\n\nНа Mac: меню Apple → «Об этом Mac». Чип Apple M… — Apple Silicon; процессор Intel — Intel.',
+    [...Object.entries(PLATFORMS).map(([key, value]) => [btn(value.label + (!admin && !availableFile(db, key) ? ' — готовится' : ''), mode + ':' + key)]),
+      [btn('← Назад', admin ? 'adm:panel' : 'home')]]);
+}
+
+async function sendProduct(chatId, platform = db.pendingPlatforms[chatId] || db.users[chatId]?.platform || 'windows') {
+  if (!db.buyers[chatId]) return false;
+  const file = availableFile(db, platform);
+  if (file?.fileId) {
+    await api('sendDocument', { chat_id: chatId, document: file.fileId, caption: `${PRODUCT} — ${PLATFORMS[platform].label}. ${PLATFORMS[platform].hint}` });
+  } else if (file?.url) {
+    await send(chatId, `Скачать ${esc(PLATFORMS[platform].label)}: ${esc(file.url)}`);
   } else {
-    // файла нет — запоминаем покупателя, продавец отправит ему файл одной кнопкой
     if (!db.pendingDelivery.includes(chatId)) db.pendingDelivery.push(chatId);
+    db.pendingPlatforms[chatId] = platform;
     save();
-    await send(chatId, 'Файл пришлём в ближайшее время — продавец уже получил уведомление.');
-    if (db.adminId) {
-      await send(db.adminId, `⚠ Покупатель (id ${chatId}) оплатил, но установщик ещё не загружен.\n\n1) «📦 Загрузить установщик» — пришлите файл\n2) «📤 Отправить покупателю»`,
-        [[btn('📦 Загрузить установщик', 'adm:file')], [btn('📤 Отправить покупателю', `resend:${chatId}`)]]).catch(() => {});
-    }
-    return;
+    await send(chatId, 'Эта версия ещё не загружена. Продавец получил уведомление.');
+    if (db.adminId) await send(db.adminId, `⚠ Покупатель id ${chatId} ждёт ${esc(PLATFORMS[platform]?.label || platform)}.`,
+      [[btn('📦 Загрузить установщик', 'upload:' + platform)], [btn('📤 Отправить покупателю', 'resend:' + chatId)]]).catch(() => {});
+    return false;
   }
   db.pendingDelivery = db.pendingDelivery.filter((id) => id !== chatId);
+  delete db.pendingPlatforms[chatId];
   save();
+  return true;
 }
 
 // ---------------------------------------------------------------- экраны покупателя
@@ -255,7 +271,7 @@ async function welcome(chatId, u) {
     '💬 Даёт готовые сообщения для WhatsApp и Telegram',
     '📊 Ведёт воронку: от первого сообщения до сделки',
     '',
-    'Один найденный клиент окупает программу в несколько раз. Покупка один раз — без подписок, работает на вашем компьютере (Windows).',
+    'Один найденный клиент окупает программу в несколько раз. Покупка один раз — без подписок, работает на вашем компьютере. Выберите Windows или macOS; доступные версии показаны в меню.',
     '',
     bought ? '✅ Программа у вас уже есть — скачать её можно в личном кабинете.' : `Цена: <b>${rub(S.priceRub)}</b> · картой, звёздами Telegram или криптой.`,
   ].join('\n');
@@ -269,8 +285,11 @@ async function welcome(chatId, u) {
 
 async function payScreen(chatId, msgId, u) {
   if (db.buyers[u.id]) return show(chatId, msgId, `Вы уже купили <b>${esc(PRODUCT)}</b> (заказ №${db.buyers[u.id]}).`, [[btn('⬇ Скачать', 'download')], [btn('👤 Личный кабинет', 'profile')]]);
+  const platform = db.users[u.id]?.platform;
+  if (!validPlatform(platform)) return platformScreen(chatId, msgId);
+  if (!availableFile(db, platform)) return show(chatId, msgId, 'Эта версия пока готовится. Оплата станет доступна после загрузки установщика.', [[btn('Выбрать платформу', 'platforms')], [btn('❓ Помощь', 'help')]]);
   const q = await quote(u.id);
-  const lines = [`🛒 <b>Покупка ${esc(PRODUCT)}</b>`, '', `Цена: <b>${rub(q.price)}</b>`];
+  const lines = [`🛒 <b>Покупка ${esc(PRODUCT)}</b>`, `Платформа: ${esc(PLATFORMS[platform].label)}`, '', `Цена: <b>${rub(q.price)}</b>`];
   if (q.bonus) lines.push(`Бонусами: −${rub(q.bonus)}`, `К оплате: <b>${rub(q.toPay)}</b>`);
   lines.push('', 'Выберите способ оплаты — установщик придёт сюда сразу после оплаты:');
   const rows = [];
@@ -281,6 +300,7 @@ async function payScreen(chatId, msgId, u) {
     if (hasCard()) rows.push([btn(`💳 Переводом на карту — ${rub(q.toPay)}`, 'buy:card')]);
     if (hasCrypto()) rows.push([btn(`🪙 Криптовалютой — ${q.usdt} ${CRYPTO_ASSET}`, 'buy:crypto')]);
   }
+  rows.push([btn('Изменить платформу', 'platforms')]);
   rows.push([btn('❓ Помощь с оплатой', 'help'), btn('← Назад', 'home')]);
   return show(chatId, msgId, lines.join('\n'), rows);
 }
@@ -331,6 +351,8 @@ async function askSupport(chatId) {
 
 async function buy(chatId, u, method) {
   if (db.buyers[u.id]) return payScreen(chatId, null, u);
+  const platform = db.users[u.id]?.platform;
+  if (!validPlatform(platform) || !availableFile(db, platform)) return payScreen(chatId, null, u);
   const q = await quote(u.id);
   if (method === 'balance') {
     if (q.toPay !== 0) return payScreen(chatId, null, u);
@@ -341,7 +363,7 @@ async function buy(chatId, u, method) {
     return api('sendInvoice', {
       chat_id: chatId,
       title: PRODUCT,
-      description: `Программа для Windows: находит бизнес без сайта и собирает демо-сайт. Заказ №${order.id}.`,
+      description: `Программа ${PLATFORMS[platform].label}: находит бизнес без сайта и собирает демо-сайт. Заказ №${order.id}.`,
       payload: `order:${order.id}`,
       currency: 'XTR',
       prices: [{ label: PRODUCT, amount: q.stars }],
@@ -440,7 +462,7 @@ async function adminPanel(chatId, msgId) {
     `💳 Карта: ${S.cardNumber ? `•••• ${esc(S.cardNumber.replace(/\D/g, '').slice(-4))}` : 'не задана'}`,
     `🪙 Крипта: ${S.cryptoPayToken ? '@CryptoBot' : S.cryptoWallet ? `кошелёк ${esc(S.cryptoNetwork)}` : 'не задана'}`,
     `☎ Поддержка: ${S.support ? esc(S.support) : 'сообщения приходят сюда'}`,
-    `📦 Установщик: ${db.fileId ? esc(db.fileName ?? 'загружен') : DOWNLOAD_URL ? 'ссылка' : '<b>не загружен</b>'}`,
+    ...Object.entries(PLATFORMS).map(([key, value]) => `📦 ${value.label}: ${availableFile(db, key) ? esc(db.files[key].fileName || 'загружен') : 'не загружен'}`),
     '',
     `Продаж: ${paid.length} · пользователей: ${Object.keys(db.users).length}`,
   ].join('\n');
@@ -562,11 +584,14 @@ async function onMessage(msg) {
   // ожидаемый ввод (команды его отменяют)
   if (w && !cmd) {
     if (w.kind === 'file' && isAdmin(u.id) && msg.document) {
+      const platform = w.platform || 'windows';
+      const name = msg.document.file_name || '';
+      if (!name.toLowerCase().endsWith(PLATFORMS[platform].extension)) return send(chatId, `Нужен файл ${PLATFORMS[platform].extension} для ${PLATFORMS[platform].label}. Пришлите правильный установщик.`);
       waiting.delete(chatId);
-      db.fileId = msg.document.file_id;
-      db.fileName = msg.document.file_name ?? null;
+      db.files[platform] = { fileId: msg.document.file_id, fileName: name };
+      if (platform === 'windows') { db.fileId = msg.document.file_id; db.fileName = name; }
       save();
-      await send(chatId, `✓ Установщик сохранён: ${esc(db.fileName ?? 'файл')}. Покупатели получат его сразу после оплаты.`);
+      await send(chatId, `✓ ${PLATFORMS[platform].label}: ${esc(name)} сохранён.`);
       if (db.pendingDelivery.length) {
         return send(chatId, `Файла ждут покупатели: ${db.pendingDelivery.length}.`, [[btn(`📤 Отправить всем (${db.pendingDelivery.length})`, 'resend:all')]]);
       }
@@ -621,7 +646,7 @@ async function onMessage(msg) {
     case '/help':
       return askSupport(chatId);
     case '/terms':
-      return send(chatId, `После оплаты вы получаете установщик ${esc(PRODUCT)} для Windows — сразу, в этом чате. Покупка разовая, без подписки. Если файл не пришёл или не запускается — /paysupport.`);
+      return send(chatId, `После оплаты вы получаете установщик ${esc(PRODUCT)} для выбранной платформы — в этом чате. Покупка разовая, без подписки. Если файл не пришёл или не запускается — /paysupport.`);
     case '/admin':
       if (!db.adminId && ADMIN_CODE && args[0] === ADMIN_CODE) {
         db.adminId = u.id;
@@ -637,12 +662,10 @@ async function onMessage(msg) {
       case '/stats':
         return stats(chatId);
       case '/setfile':
-        waiting.set(chatId, { kind: 'file' });
-        return send(chatId, 'Пришлите установщик одним файлом (как документ).', [[btn('Отмена', 'adm:panel')]]);
+        return platformScreen(chatId, null, 'upload');
       case '/resend':
         if (!args[0]) return send(chatId, 'Укажите id покупателя: /resend 123456');
-        await sendProduct(Number(args[0]));
-        return send(chatId, 'Отправлено.');
+        return send(chatId, await sendProduct(Number(args[0])) ? 'Отправлено.' : 'Файл пока не отправлен.');
       case '/refund': {
         const o = db.orders[args[0]];
         if (!o || o.method !== 'stars' || o.status !== 'paid') return send(chatId, 'Возврат возможен только по оплаченному звёздами заказу: /refund НОМЕР');
@@ -678,7 +701,19 @@ async function onCallback(q) {
     case 'profile': return profile(chatId, msgId, u);
     case 'invite': return invite(chatId, msgId, u);
     case 'help': return askSupport(chatId);
-    case 'download': return db.buyers[u.id] ? sendProduct(chatId) : payScreen(chatId, msgId, u);
+    case 'download': return db.buyers[u.id] ? platformScreen(chatId, msgId, 'get') : payScreen(chatId, msgId, u);
+    case 'platforms': return platformScreen(chatId, msgId);
+    case 'select':
+    case 'get':
+      if (!validPlatform(arg)) return;
+      if (action === 'get' && !db.buyers[u.id]) return payScreen(chatId, msgId, u);
+      db.users[u.id].platform = arg;
+      save();
+      return action === 'get' ? sendProduct(chatId, arg) : payScreen(chatId, msgId, u);
+    case 'upload':
+      if (!isAdmin(u.id) || !validPlatform(arg)) return;
+      waiting.set(chatId, { kind: 'file', platform: arg });
+      return send(chatId, `Пришлите установщик ${PLATFORMS[arg].extension} для ${PLATFORMS[arg].label} как документ.`, [[btn('Отмена', 'adm:panel')]]);
     case 'buy':
       try {
         return await buy(chatId, u, arg);
@@ -690,12 +725,11 @@ async function onCallback(q) {
 
   // отправить установщик покупателю (или всем ожидающим) одной кнопкой
   if (action === 'resend' && isAdmin(u.id)) {
-    if (!db.fileId && !DOWNLOAD_URL) {
-      return send(chatId, 'Сначала загрузите установщик — потом нажмите «Отправить» ещё раз.', [[btn('📦 Загрузить установщик', 'adm:file')]]);
-    }
     const list = arg === 'all' ? [...db.pendingDelivery] : [Number(arg)];
-    for (const id of list) await sendProduct(id);
-    return show(chatId, msgId, `✓ Установщик отправлен: ${list.length === 1 ? `покупатель id ${list[0]}` : `${list.length} покупателям`}.`, []);
+    let sent = 0;
+    for (const id of list) if (await sendProduct(id)) sent++;
+    return show(chatId, msgId, `✓ Отправлено: ${sent}. Ожидают файла: ${list.length - sent}.`, []);
+
   }
 
   if (action === 'adm' && isAdmin(u.id)) {
@@ -703,8 +737,7 @@ async function onCallback(q) {
     if (arg === 'panel') return adminPanel(chatId, msgId);
     if (arg === 'stats') return stats(chatId, msgId);
     if (arg === 'file') {
-      waiting.set(chatId, { kind: 'file' });
-      return send(chatId, 'Пришлите установщик одним файлом (как документ). Размер не ограничен.', [[btn('Отмена', 'adm:panel')]]);
+      return platformScreen(chatId, msgId, 'upload');
     }
     if (SETTINGS[arg]) {
       waiting.set(chatId, { kind: 'set', key: arg });
@@ -728,7 +761,7 @@ async function onCallback(q) {
     if (order.status === 'paid') return send(chatId, `Заказ №${order.id} уже выдан.`);
     if (action === 'ok') {
       await deliver(order);
-      return show(chatId, msgId, `✅ Заказ №${order.id} подтверждён${db.fileId || DOWNLOAD_URL ? ', установщик отправлен покупателю' : ''}.`, []);
+      return show(chatId, msgId, `✅ Заказ №${order.id} подтверждён${availableFile(db, order.platform || 'windows') ? ', установщик доступен покупателю' : ''}.`, []);
     }
     order.status = 'rejected';
     save();
@@ -785,7 +818,7 @@ async function setup() {
   botUsername = me.username;
   await setCommands();
   await api('setMyShortDescription', { short_description: `${PRODUCT} — находит клиентов без сайта и собирает им демо-сайт` .slice(0, 120) }).catch(() => {});
-  await api('setMyDescription', { description: `${PRODUCT} — программа для Windows: находит компании без сайта в 2ГИС, Яндексе и OpenStreetMap, готовит промпт для нейросети и собирает демо-сайт для клиента.\n\nНажмите «Старт», чтобы узнать больше.`.slice(0, 512) }).catch(() => {});
+  await api('setMyDescription', { description: `${PRODUCT} — программа для Windows и macOS: находит компании без сайта в 2ГИС, Яндексе и OpenStreetMap, готовит промпт для нейросети и собирает демо-сайт для клиента.\n\nНажмите «Старт», чтобы узнать больше.`.slice(0, 512) }).catch(() => {});
   log(`Бот @${me.username} запущен. Цена ${S.priceRub} ₽, карта: ${hasCard() ? 'да' : 'нет'}, крипта: ${hasCrypto() ? 'да' : 'нет'}.`);
   if (!db.adminId) log('Администратор не назначен: задайте ADMIN_ID или напишите боту /admin <ADMIN_CODE>');
   if (!db.fileId && !DOWNLOAD_URL) log('Установщик не загружен: /admin → «Загрузить установщик».');
